@@ -1,0 +1,8 @@
+#!/bin/bash
+
+BASEDIR="$(cd "`dirname "$0"`" && pwd)"
+cd "$BASEDIR"
+
+mkdir -p bin
+javac -classpath external/postgresql-42.5.4.jar -d bin `find src -name '*.java'`
+

@@ -1,0 +1,12 @@
+{
+    "username": "",
+    "password": "",
+    "database": "",
+    "host": "",
+    "port": 0,
+    "aqpServerPort": 0,
+    "txnDriverJar": "",
+    "aqpNativeSvcPort": 0,
+    "sMemPath": "",
+    "clusterName": ""
+}

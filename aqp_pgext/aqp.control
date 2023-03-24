@@ -1,0 +1,7 @@
+comment = 'Approximate Query Processing Support for PostgreSQL with AB-tree and tablesample SWR'
+default_version = '0.0.1'
+module_pathname = '$libdir/aqp'
+relocatable = false  # The plan rewriter will assume dummy functions are placed
+                     # in a specific schema aqp currently.
+                     # TODO(zy): find ways to make it relocatable?
+schema = 'aqp'

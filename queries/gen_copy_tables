@@ -1,0 +1,26 @@
+#!/bin/bash
+
+if [ $# -lt 1 ]; then
+    echo "usage: $0 <rawdata_path>"
+    exit 1
+fi
+
+
+cat << EOF | sed "s,%rawdata_path%,$1,"
+-- sql script to copy tables 
+-- create database tpcc_w10_cwang39 with owner = 'cwang39' template = testdb_release allow_connections = true;
+-- create role zzhao35 with login password ‘...’; 
+copy customer from '%rawdata_path%/customer.tbl'(DELIMITER('|')); 
+copy district from '%rawdata_path%/district.tbl'(DELIMITER('|'));   
+copy history from '%rawdata_path%/history.tbl'(DELIMITER('|'));  
+copy stock from '%rawdata_path%/stock.tbl'(DELIMITER('|'));  
+copy warehouse from '%rawdata_path%/warehouse.tbl'(DELIMITER('|'));  
+copy region from '%rawdata_path%/region.tbl'(DELIMITER('|'));
+copy nation from '%rawdata_path%/nation.tbl'(DELIMITER('|')); 
+copy supplier from '%rawdata_path%/supplier.tbl'(DELIMITER('|')); 
+copy orders from '%rawdata_path%/orders.tbl'(DELIMITER('|')); 
+copy partsupp from '%rawdata_path%/partsupp.tbl'(DELIMITER('|'));
+copy item from '%rawdata_path%/item.tbl'(DELIMITER('|')); 
+copy neworder from '%rawdata_path%/neworder.tbl'(DELIMITER('|'));
+copy orderline from '%rawdata_path%/orderline.tbl'(DELIMITER('|')); 
+EOF

@@ -1,0 +1,1280 @@
+#include "aqp.h"
+
+#include <access/abtree.h>
+#include <access/genam.h>
+#include <access/tsmapi.h>
+#include <catalog/pg_am.h>
+#include <nodes/makefuncs.h>
+#include <nodes/nodeFuncs.h>
+#include <nodes/parsenodes.h>
+#include <nodes/pathnodes.h>
+#include <optimizer/cost.h>
+#include <optimizer/optimizer.h>
+#include <optimizer/pathnode.h>
+#include <optimizer/paths.h>
+#include <optimizer/paramassign.h>
+#include <optimizer/placeholder.h>
+#include <optimizer/restrictinfo.h>
+#include <utils/fmgroids.h>
+#include <utils/selfuncs.h>
+#include <utils/spccache.h>
+
+#include <math.h>
+
+#include "aqp_planner.h"
+#include "pg_indxpath.h"
+#include "aqp_swrscan.h"
+
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+
+static void aqp_set_rel_pathlist(PlannerInfo *root,
+                                 RelOptInfo *rel,
+                                 Index rti,
+                                 RangeTblEntry *rte);
+static void aqp_clear_samplescan_path(RelOptInfo *rel);
+static void aqp_add_swr_path(PlannerInfo *root,
+                             RelOptInfo *rel,
+                             TableSampleClause *tsc);
+static List* aqp_build_swr_path(PlannerInfo *root,
+                   RelOptInfo *rel,
+                   IndexOptInfo *index,
+                   IndexClauseSet *clauses,
+                   TableSampleClause *tsc);
+static AQPSWRPath* aqp_create_swr_path(PlannerInfo *root,
+                                       IndexOptInfo *index,
+                                       List *index_clauses,
+                                       bool index_only_scan,
+                                       Relids outer_relids,
+                                       double loop_count,
+                                       TableSampleClause *tsc);
+static List *aqp_pgport_extract_nonindex_conditions(List *qual_clauses,
+                                                    List *indexclauses);
+static void aqp_cost_swr_path(PlannerInfo *root, AQPSWRPath *path,
+                              double loop_count);
+static void aqp_pgport_fix_indexqual_references(PlannerInfo *root,
+                                                IndexOptInfo *index,
+                                                List *indexclauses,
+                                                List **stripped_indexquals_p,
+                                                List **fixed_indexquals_p);
+static Node *aqp_pgport_fix_indexqual_clause(PlannerInfo *root,
+                                             IndexOptInfo *index,
+                                             int indexcol,
+                                             Node *clause, List *indexcolnos);
+static Node *aqp_pgport_fix_indexqual_operand(Node *node, IndexOptInfo *index,
+                                              int indexcol);
+static List * aqp_pgport_order_qual_clauses(PlannerInfo *root, List *clauses);
+static CustomScan* aqp_make_swrindexonlyscan(List *qptlist,
+                                             List *qpqual,
+                                             Index scanrelid,
+                                             Oid indexid,
+                                             List *indexqual,
+                                             List *indextlist,
+                                             uint64 sample_size,
+                                             Expr *repeatable_expr,
+                                             Expr *sample_size_expr);
+static CustomScan* aqp_make_swrscan(List *qptlist,
+                                    List *qpqual,
+                                    Index scanrelid,
+                                    Oid indexid,
+                                    List *indexqual,
+                                    List *indexqualorig,
+                                    uint64 sample_size,
+                                    Expr *repeatable_expr,
+                                    Expr *sample_size_expr);
+
+static CustomPathMethods aqp_swr_path_methods = {
+    AQPSWRScanPrivateName,
+    aqp_plan_swr_path,
+    aqp_reparameterize_custom_path_by_child
+};
+
+static void
+aqp_set_rel_pathlist(PlannerInfo *root,
+                     RelOptInfo *rel,
+                     Index rti,
+                     RangeTblEntry *rte)
+{
+    TableSampleClause           *tsc = rte->tablesample;
+
+    if (prev_set_rel_pathlist_hook)
+        prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+    if (!aqp_fn_oid_cached)
+        return ;
+    
+    if (tsc && tsc->tsmhandler == aqp_swr_tsm_handler_oid)
+    {
+        aqp_clear_samplescan_path(rel);
+        aqp_add_swr_path(root, rel, tsc);
+    }
+}
+
+static void
+aqp_clear_samplescan_path(RelOptInfo *rel)
+{
+    ListCell    *p;
+
+    foreach(p, rel->pathlist)
+    {
+        Path    *path = (Path *) lfirst(p);
+        if (path->pathtype == T_SampleScan)
+        {
+            /* remove all sample scan path generated by the PG optimizer */
+            rel->pathlist = foreach_delete_current(rel->pathlist, p);
+            pfree(path);
+        }
+    }
+    
+    /* XXX(zy) PG 13.1: no path should remain at this point */
+    Assert(rel->pathlist == NIL);
+}
+
+static void
+aqp_add_swr_path(PlannerInfo *root,
+                 RelOptInfo *rel,
+                 TableSampleClause *tsc)
+{
+    ListCell            *lc;
+    IndexClauseSet      rclauseset;
+
+    /* 
+     * SWR path is similar to index path but is restricted to use AB-tree.
+     * See optimizer/path/idxpath.c: create_index_paths().
+     */
+    foreach(lc, rel->indexlist)
+    {
+        IndexOptInfo    *index = (IndexOptInfo *) lfirst(lc);
+        List            *paths;
+        ListCell        *lc2;
+
+        if (index->relam != ABTREE_AM_OID)
+            continue;
+        
+        /* partial index whose predicate does not match the query predicates */
+        if (index->indpred != NIL && !index->predOK)
+            continue;
+
+        MemSet(&rclauseset, 0, sizeof(rclauseset));
+        aqp_pgport_match_restriction_clauses_to_index(root, index, &rclauseset);
+
+        paths = aqp_build_swr_path(root, rel, index, &rclauseset, tsc);
+        foreach(lc2, paths)
+        {
+            add_path(rel, (Path*) lfirst(lc2));
+        }
+    }
+
+}
+
+static List*
+aqp_build_swr_path(PlannerInfo *root,
+                   RelOptInfo *rel,
+                   IndexOptInfo *index,
+                   IndexClauseSet *clauses,
+                   TableSampleClause *tsc)
+{
+    List       *result = NIL;
+    Path       *ipath;
+    List       *index_clauses;
+    Relids        outer_relids;
+    double        loop_count;
+    bool        index_only_scan;
+    int            indexcol;
+
+    /*
+     * 1. Combine the per-column IndexClause lists into an overall list.
+     *
+     * In the resulting list, clauses are ordered by index key, so that the
+     * column numbers form a nondecreasing sequence.  (This order is depended
+     * on by btree and possibly other places.)  The list can be empty, if the
+     * index AM allows that.
+     *
+     * found_lower_saop_clause is set true if we accept a ScalarArrayOpExpr
+     * index clause for a non-first index column.  This prevents us from
+     * assuming that the scan result is ordered.  (Actually, the result is
+     * still ordered if there are equality constraints for all earlier
+     * columns, but it seems too expensive and non-modular for this code to be
+     * aware of that refinement.)
+     *
+     * We also build a Relids set showing which outer rels are required by the
+     * selected clauses.  Any lateral_relids are included in that, but not
+     * otherwise accounted for.
+     */
+    index_clauses = NIL;
+    outer_relids = bms_copy(rel->lateral_relids);
+    for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+    {
+        ListCell   *lc;
+
+        foreach(lc, clauses->indexclauses[indexcol])
+        {
+            IndexClause *iclause = (IndexClause *) lfirst(lc);
+            RestrictInfo *rinfo = iclause->rinfo;
+
+            /* We might need to omit ScalarArrayOpExpr clauses */
+            if (IsA(rinfo->clause, ScalarArrayOpExpr))
+            {
+                /* XXX sample scan shouldn't have any ScalarArryOpExpr. */
+                continue;
+            }
+
+            /* OK to include this clause */
+            index_clauses = lappend(index_clauses, iclause);
+            outer_relids = bms_add_members(outer_relids,
+                                           rinfo->clause_relids);
+        }
+    }
+
+    /* We do not want the index's rel itself listed in outer_relids */
+    outer_relids = bms_del_member(outer_relids, rel->relid);
+    /* Enforce convention that outer_relids is exactly NULL if empty */
+    if (bms_is_empty(outer_relids))
+        outer_relids = NULL;
+
+    /* Compute loop_count for cost estimation purposes */
+    loop_count = pg_port_get_loop_count(root, rel->relid, outer_relids);
+
+    /* 
+     * 2. Index ordering is never useful for sample scans, so we skip
+     * computing the path keys. 
+     */
+
+    /*
+     * 3. Check if an index-only scan is possible.  If we're not building
+     * plain indexscans, this isn't relevant since bitmap scans don't support
+     * index data retrieval anyway.
+     */
+    index_only_scan = pg_port_check_index_only(rel, index);
+    
+    /* 
+     * Generate the sample scan swr path here.
+     * XXX(zy) this should be replace by a custom path
+     */
+    /*ipath = (Path*) create_index_path(root, index, index_clauses,
+                      NIL, NIL, NIL,
+                      ForwardScanDirection,
+                      index_only_scan,
+                      outer_relids,
+                      loop_count,
+                      false,
+                      tsc); */
+    ipath = (Path*) aqp_create_swr_path(root, index, index_clauses,
+                                index_only_scan, outer_relids, loop_count, tsc);
+    result = lappend(result, ipath);
+
+    return result;
+}
+
+static AQPSWRPath*
+aqp_create_swr_path(PlannerInfo *root,
+                    IndexOptInfo *index,
+                    List *index_clauses,
+                    bool index_only_scan,
+                    Relids outer_relids,
+                    double loop_count,
+                    TableSampleClause *tsc)
+{
+    RelOptInfo *rel = index->rel;
+    AQPSWRPath *path;
+    Node       *num_rows_node;
+    int64      num_rows;
+
+    path = (AQPSWRPath*) palloc(sizeof(AQPSWRPath));
+    
+    path->cpath.path.type = T_CustomPath;
+    path->cpath.path.pathtype = T_CustomScan;
+    path->cpath.path.parent = rel;
+    path->cpath.path.pathtarget = rel->reltarget;
+    path->cpath.path.param_info = get_baserel_parampathinfo(root, rel,
+                                                            outer_relids);
+    path->cpath.path.parallel_aware = false;
+    path->cpath.path.parallel_safe = false; /* XXX(zy) no parallel support in AB-tree */
+    path->cpath.path.parallel_workers = 0;
+    path->cpath.path.pathkeys = NIL;
+    
+    /* no backward scan or mark restore support in AB-tree */
+    path->cpath.flags = 0;
+    path->cpath.custom_paths = NIL;
+    path->cpath.custom_private = NIL; /* XXX(zy) we don't use custom_private */
+    path->cpath.methods = &aqp_swr_path_methods;
+
+    /* index path info */
+    path->indexinfo = index;
+    path->indexclauses = index_clauses;
+    path->index_only_scan = index_only_scan;
+    
+    /* sampling info */
+    num_rows_node = (Node *) linitial(tsc->args);
+    num_rows_node = eval_const_expressions(root, num_rows_node);
+    if (IsA(num_rows_node, Const) &&
+        !((Const *) num_rows_node)->constisnull)
+    {
+        /* guaranteed by tsm->parameterTypes */
+        num_rows = DatumGetInt64(((Const *) num_rows_node)->constvalue);
+        path->sample_size_expr = NULL; 
+    }
+    else
+    {
+        /* 
+         * If we don't know the sample size, we set it to a somewhat arbitrary
+         * number of 100. We don't want it to be too small because we don't
+         * want to the cost estimizer to produce a cost that is unreasonably
+         * small.
+         */
+        num_rows = 100;
+        path->sample_size_expr = (Expr*) num_rows_node;
+    }
+
+    if (num_rows <= 0)
+    {
+        ereport(ERROR,
+                errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("non-positive row count %ld in TABLESAMPLE swr",
+                       num_rows));
+    }
+
+    path->sample_size = (uint64) num_rows;
+    path->repeatable_expr = tsc->repeatable;
+
+    aqp_cost_swr_path(root, path, loop_count);
+
+    return path;
+}
+
+/*
+ * aqp_cost_swr_path
+ *      Determines and returns the cost of sampling an index using an AB-tree
+ *
+ *    This is adapted from cost_index() in src/backend/optimizer/path/costsize.c.
+ *
+ *    Below is the original description for cost_index():
+ *
+ * 'path' describes the indexscan under consideration, and is complete
+ *        except for the fields to be set by this routine
+ * 'loop_count' is the number of repetitions of the indexscan to factor into
+ *        estimates of caching behavior
+ *
+ * In addition to rows, startup_cost and total_cost, cost_index() sets the
+ * path's indextotalcost and indexselectivity fields.  These values will be
+ * needed if the IndexPath is used in a BitmapIndexScan.
+ *
+ * NOTE: path->indexquals must contain only clauses usable as index
+ * restrictions.  Any additional quals evaluated as qpquals may reduce the
+ * number of returned tuples, but they won't reduce the number of tuples
+ * we have to fetch from the table, so they don't reduce the scan cost.
+ */
+static void
+aqp_cost_swr_path(PlannerInfo *root, AQPSWRPath *path, double loop_count)
+{
+    IndexOptInfo *index = path->indexinfo;
+    RelOptInfo *baserel = index->rel;
+    bool        indexonly = path->index_only_scan;
+    List       *qpquals;
+    Cost        startup_cost = 0;
+    Cost        run_cost = 0;
+    Cost        cpu_run_cost = 0;
+    Cost        indexStartupCost;
+    Cost        indexTotalCost;
+    Selectivity indexSelectivity;
+    double        indexCorrelation,
+                csquared;
+    double        spc_seq_page_cost,
+                spc_random_page_cost;
+    Cost        min_IO_cost,
+                max_IO_cost;
+    QualCost    qpqual_cost;
+    Cost        cpu_per_tuple;
+    double        tuples_fetched;
+    double        pages_fetched;
+    double      num_pages_fetched;
+
+    /* Should only be applied to base relations */
+    Assert(IsA(baserel, RelOptInfo) &&
+           IsA(index, IndexOptInfo));
+    Assert(baserel->relid > 0);
+    Assert(baserel->rtekind == RTE_RELATION);
+    Assert(index->relam == ABTREE_AM_OID);
+
+    /*
+     * Mark the path with the correct row estimate, and identify which quals
+     * will need to be enforced as qpquals.  We need not check any quals that
+     * are implied by the index's predicate, so we can use indrestrictinfo not
+     * baserestrictinfo as the list of relevant restriction clauses for the
+     * rel.
+     */
+    if (path->cpath.path.param_info)
+    {
+        path->cpath.path.rows = path->cpath.path.param_info->ppi_rows;
+        /* qpquals come from the rel's restriction clauses and ppi_clauses */
+        qpquals = list_concat(aqp_pgport_extract_nonindex_conditions(
+                                path->indexinfo->indrestrictinfo,
+                                path->indexclauses),
+                              aqp_pgport_extract_nonindex_conditions(
+                                path->cpath.path.param_info->ppi_clauses,
+                                path->indexclauses));
+    }
+    else
+    {
+        path->cpath.path.rows = baserel->rows;
+        /* qpquals come from just the rel's restriction clauses */
+        qpquals = aqp_pgport_extract_nonindex_conditions(
+                    path->indexinfo->indrestrictinfo,
+                    path->indexclauses);
+    }
+
+    if (!enable_indexscan)
+        startup_cost += disable_cost;
+    /* we don't need to check enable_indexonlyscan; indxpath.c does that */
+
+    if (index->tree_height == -1)
+    {
+        Relation rel = index_open(index->indexoid, NoLock);
+        index->tree_height = _abt_getrootheight(rel);
+        index_close(rel, NoLock);
+    }
+    
+    /* XXX(zy) hard-coded AB-tree cost estimator here */
+
+    get_tablespace_page_costs(index->reltablespace,
+                              &spc_random_page_cost, NULL);
+
+    indexStartupCost = 0;
+
+    /* this is the number of accesses */
+    num_pages_fetched = path->sample_size * loop_count;
+    if (index->tree_height > 3)
+    {
+        /* For the top three levels, it is usually small enough. 
+         *
+         * Even with fan-out of 200, 1 + 200 + 200 * 200 = 40201 pages =
+         * 314.070 MB (assuming 8KB pages), which is well within a typical
+         * value for effective_cache_size (defaults to 4GB but we usually have
+         * substantially larger systems nowadays). Starting from level 4,
+         * though, we count each access as a random I/O. This will definintely
+         * be an overcounting the the actual cost, but since we are not
+         * comparing ourselves with any other access path, so that might be ok
+         * for now.
+         */
+        num_pages_fetched = num_pages_fetched * (index->tree_height - 3);
+    }
+
+    num_pages_fetched = index_pages_fetched(num_pages_fetched, index->pages,
+                        (double) index->pages, root);
+    indexTotalCost = num_pages_fetched * spc_random_page_cost / loop_count;
+    indexSelectivity =
+        (1.0 - pow(1.0 - 1.0 / baserel->tuples, path->sample_size));
+    indexCorrelation = 0;
+
+    /*
+     * Save amcostestimate's results for possible use in bitmap scan planning.
+     * We don't bother to save indexStartupCost or indexCorrelation, because a
+     * bitmap scan doesn't care about either.
+     */
+    path->indextotalcost = indexTotalCost;
+    path->indexselectivity = indexSelectivity;
+
+    /* all costs for touching index itself included here */
+    startup_cost += indexStartupCost;
+    run_cost += indexTotalCost - indexStartupCost;
+
+    /* estimate number of main-table tuples fetched */
+    tuples_fetched = path->sample_size;
+
+    /* fetch estimated page costs for tablespace containing table */
+    get_tablespace_page_costs(baserel->reltablespace,
+                              &spc_random_page_cost,
+                              &spc_seq_page_cost);
+
+    /*----------
+     * Estimate number of main-table pages fetched, and compute I/O cost.
+     *
+     * When the index ordering is uncorrelated with the table ordering,
+     * we use an approximation proposed by Mackert and Lohman (see
+     * index_pages_fetched() for details) to compute the number of pages
+     * fetched, and then charge spc_random_page_cost per page fetched.
+     *
+     * When the index ordering is exactly correlated with the table ordering
+     * (just after a CLUSTER, for example), the number of pages fetched should
+     * be exactly selectivity * table_size.  What's more, all but the first
+     * will be sequential fetches, not the random fetches that occur in the
+     * uncorrelated case.  So if the number of pages is more than 1, we
+     * ought to charge
+     *        spc_random_page_cost + (pages_fetched - 1) * spc_seq_page_cost
+     * For partially-correlated indexes, we ought to charge somewhere between
+     * these two estimates.  We currently interpolate linearly between the
+     * estimates based on the correlation squared (XXX is that appropriate?).
+     *
+     * If it's an index-only scan, then we will not need to fetch any heap
+     * pages for which the visibility map shows all tuples are visible.
+     * Hence, reduce the estimated number of heap fetches accordingly.
+     * We use the measured fraction of the entire heap that is all-visible,
+     * which might not be particularly relevant to the subset of the heap
+     * that this query will fetch; but it's not clear how to do better.
+     *----------
+     */
+    if (loop_count > 1)
+    {
+        /*
+         * For repeated indexscans, the appropriate estimate for the
+         * uncorrelated case is to scale up the number of tuples fetched in
+         * the Mackert and Lohman formula by the number of scans, so that we
+         * estimate the number of pages fetched by all the scans; then
+         * pro-rate the costs for one scan.  In this case we assume all the
+         * fetches are random accesses.
+         */
+        pages_fetched = index_pages_fetched(tuples_fetched * loop_count,
+                                            baserel->pages,
+                                            (double) index->pages,
+                                            root);
+
+        if (indexonly)
+            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+
+        max_IO_cost = (pages_fetched * spc_random_page_cost) / loop_count;
+
+        /*
+         * In the perfectly correlated case, the number of pages touched by
+         * each scan is selectivity * table_size, and we can use the Mackert
+         * and Lohman formula at the page level to estimate how much work is
+         * saved by caching across scans.  We still assume all the fetches are
+         * random, though, which is an overestimate that's hard to correct for
+         * without double-counting the cache effects.  (But in most cases
+         * where such a plan is actually interesting, only one page would get
+         * fetched per scan anyway, so it shouldn't matter much.)
+         */
+        pages_fetched = ceil(indexSelectivity * (double) baserel->pages);
+
+        pages_fetched = index_pages_fetched(pages_fetched * loop_count,
+                                            baserel->pages,
+                                            (double) index->pages,
+                                            root);
+
+        if (indexonly)
+            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+
+        min_IO_cost = (pages_fetched * spc_random_page_cost) / loop_count;
+    }
+    else
+    {
+        /*
+         * Normal case: apply the Mackert and Lohman formula, and then
+         * interpolate between that and the correlation-derived result.
+         */
+        pages_fetched = index_pages_fetched(tuples_fetched,
+                                            baserel->pages,
+                                            (double) index->pages,
+                                            root);
+
+        if (indexonly)
+            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+
+        /* max_IO_cost is for the perfectly uncorrelated case (csquared=0) */
+        max_IO_cost = pages_fetched * spc_random_page_cost;
+
+        /* min_IO_cost is for the perfectly correlated case (csquared=1) */
+        pages_fetched = ceil(indexSelectivity * (double) baserel->pages);
+
+        if (indexonly)
+            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+
+        if (pages_fetched > 0)
+        {
+            min_IO_cost = spc_random_page_cost;
+            if (pages_fetched > 1)
+                min_IO_cost += (pages_fetched - 1) * spc_seq_page_cost;
+        }
+        else
+            min_IO_cost = 0;
+    }
+
+    /*
+     * Now interpolate based on estimated index order correlation to get total
+     * disk I/O cost for main table accesses.
+     */
+    csquared = indexCorrelation * indexCorrelation;
+
+    run_cost += max_IO_cost + csquared * (min_IO_cost - max_IO_cost);
+
+    /*
+     * Estimate CPU costs per tuple.
+     *
+     * What we want here is cpu_tuple_cost plus the evaluation costs of any
+     * qual clauses that we have to evaluate as qpquals.
+     */
+    cost_qual_eval(&qpqual_cost, qpquals, root);
+
+    startup_cost += qpqual_cost.startup;
+    cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
+
+    cpu_run_cost += cpu_per_tuple * tuples_fetched;
+
+    /* tlist eval costs are paid per output row, not per tuple scanned */
+    startup_cost += path->cpath.path.pathtarget->cost.startup;
+    cpu_run_cost += path->cpath.path.pathtarget->cost.per_tuple * path->cpath.path.rows;
+
+    run_cost += cpu_run_cost;
+
+    path->cpath.path.startup_cost = startup_cost;
+    path->cpath.path.total_cost = startup_cost + run_cost;
+}
+
+/*
+ * extract_nonindex_conditions
+ *
+ * Given a list of quals to be enforced in an indexscan, extract the ones that
+ * will have to be applied as qpquals (ie, the index machinery won't handle
+ * them).  Here we detect only whether a qual clause is directly redundant
+ * with some indexclause.  If the index path is chosen for use, createplan.c
+ * will try a bit harder to get rid of redundant qual conditions; specifically
+ * it will see if quals can be proven to be implied by the indexquals.  But
+ * it does not seem worth the cycles to try to factor that in at this stage,
+ * since we're only trying to estimate qual eval costs.  Otherwise this must
+ * match the logic in create_indexscan_plan().
+ *
+ * qual_clauses, and the result, are lists of RestrictInfos.
+ * indexclauses is a list of IndexClauses.
+ */
+static List *
+aqp_pgport_extract_nonindex_conditions(List *qual_clauses, List *indexclauses)
+{
+    List       *result = NIL;
+    ListCell   *lc;
+
+    foreach(lc, qual_clauses)
+    {
+        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+        if (rinfo->pseudoconstant)
+            continue;            /* we may drop pseudoconstants here */
+        if (is_redundant_with_indexclauses(rinfo, indexclauses))
+            continue;            /* dup or derived from same EquivalenceClass */
+        /* ... skip the predicate proof attempt createplan.c will try ... */
+        result = lappend(result, rinfo);
+    }
+    return result;
+}
+
+/*
+ * This is adapted from create_indexscan_plan() in optimizer/plan/createplan.c,
+ * except that we are using AB-tree for sampling.
+ */
+Plan*
+aqp_plan_swr_path(PlannerInfo *root,
+                  RelOptInfo *rel,
+                  CustomPath *best_path,
+                  List *tlist,
+                  List *scan_clauses,
+                  List *custom_plans)
+{
+    Scan                *scan;
+    AQPSWRPath          *path = (AQPSWRPath *) best_path;
+    List                *indexclauses = path->indexclauses;
+    Index               baserelid = rel->relid;
+    Oid                 indexoid = path->indexinfo->indexoid;
+    List                *qpqual;
+    List                *stripped_indexquals;
+    List                *fixed_indexquals;
+    ListCell            *l;
+    bool                indexonly = path->index_only_scan;
+    
+    /*
+     * We should be sampling a base relation.
+     */
+    Assert(baserelid > 0);
+    Assert(path->cpath.path.parent->rtekind == RTE_RELATION);
+    Assert(custom_plans == NIL);
+    Assert(baserelid == path->cpath.path.parent->relid);
+
+    /*
+     * Extract the index qual expressions (stripped of RestrictInfos) from the
+     * IndexClauses list, and prepare a copy with index Vars substituted for
+     * table Vars.  (This step does not replace_nestloop_params on the
+     * fixed_indexquals.)
+     */
+    aqp_pgport_fix_indexqual_references(root, path->indexinfo,
+                                        path->indexclauses,
+                                        &stripped_indexquals,
+                                        &fixed_indexquals);
+     
+    /*
+     * The qpqual list must contain all restrictions not automatically handled
+     * by the index, other than pseudoconstant clauses which will be handled
+     * by a separate gating plan node.  All the predicates in the indexquals
+     * will be checked (either by the index itself, or by nodeIndexscan.c),
+     * but if there are any "special" operators involved then they must be
+     * included in qpqual.  The upshot is that qpqual must contain
+     * scan_clauses minus whatever appears in indexquals.
+     *
+     * is_redundant_with_indexclauses() detects cases where a scan clause is
+     * present in the indexclauses list or is generated from the same
+     * EquivalenceClass as some indexclause, and is therefore redundant with
+     * it, though not equal.  (The latter happens when indxpath.c prefers a
+     * different derived equality than what generate_join_implied_equalities
+     * picked for a parameterized scan's ppi_clauses.)  Note that it will not
+     * match to lossy index clauses, which is critical because we have to
+     * include the original clause in qpqual in that case.
+     *
+     * In some situations (particularly with OR'd index conditions) we may
+     * have scan_clauses that are not equal to, but are logically implied by,
+     * the index quals; so we also try a predicate_implied_by() check to see
+     * if we can discard quals that way.  (predicate_implied_by assumes its
+     * first input contains only immutable functions, so we have to check
+     * that.)
+     *
+     * Note: if you change this bit of code you should also look at
+     * extract_nonindex_conditions() in costsize.c.
+     */
+    qpqual = NIL;
+    foreach(l, scan_clauses)
+    {
+        RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+
+        if (rinfo->pseudoconstant)
+            continue;            /* we may drop pseudoconstants here */
+        if (is_redundant_with_indexclauses(rinfo, indexclauses))
+            continue;            /* dup or derived from same EquivalenceClass */
+        if (!contain_mutable_functions((Node *) rinfo->clause) &&
+            predicate_implied_by(list_make1(rinfo->clause), stripped_indexquals,
+                                 false))
+            continue;            /* provably implied by indexquals */
+        qpqual = lappend(qpqual, rinfo);
+    }
+
+    /* Sort clauses into best execution order */
+    qpqual = aqp_pgport_order_qual_clauses(root, qpqual);
+
+    /* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
+    qpqual = extract_actual_clauses(qpqual, false);
+
+    /*
+     * We don't need to replace the nestloop params here.
+     */
+
+    /* Finally ready to build the plan node */
+    if (indexonly)
+        scan = (Scan *) aqp_make_swrindexonlyscan(tlist,
+                                                  qpqual,
+                                                  baserelid,
+                                                  indexoid,
+                                                  stripped_indexquals,
+                                                  path->indexinfo->indextlist,
+                                                  path->sample_size,
+                                                  path->repeatable_expr,
+                                                  path->sample_size_expr);
+    else
+        scan = (Scan *) aqp_make_swrscan(tlist,
+                                         qpqual,
+                                         baserelid,
+                                         indexoid,
+                                         fixed_indexquals,
+                                         stripped_indexquals,
+                                         path->sample_size,
+                                         path->repeatable_expr,
+                                         path->sample_size_expr);
+
+    /* no need to copy_generic_path_info: done in create_customscan_plan() */
+
+    return (Plan*) scan;
+}
+
+static CustomScan*
+aqp_make_swrindexonlyscan(List *qptlist,
+                          List *qpqual,
+                          Index scanrelid,
+                          Oid indexid,
+                          List *indexqual,
+                          List *indextlist,
+                          uint64 sample_size,
+                          Expr *repeatable_expr,
+                          Expr *sample_size_expr)
+{
+    CustomScan                      *node = makeNode(CustomScan); 
+    Plan                            *plan = &node->scan.plan;
+    AQPSWRIndexOnlyScanPrivate      *private;
+
+    private = palloc(sizeof(AQPSWRIndexOnlyScanPrivate));
+
+    plan->targetlist = qptlist;
+    plan->qual = qpqual;
+    plan->lefttree = NULL;
+    plan->righttree = NULL;
+
+    /* 
+     * Providing scanrelid will make ExecInitCustomScan to open the relation
+     * for us before it calls BeginCustomScan.
+     */
+    node->scan.scanrelid = scanrelid;
+    /* no backward scan or mark/restore support */
+    node->flags = 0;
+    node->custom_plans = NIL;
+    /* 
+     * We put indexqual into the custom_exprs until setrefs.c fixes the
+     * expressions. We wait until standard_planner() returns to move it
+     * into private->indexqual.
+     */
+    node->custom_exprs = indexqual;
+    node->custom_private = list_make1(private);
+    /*
+     * Providing the indextlist as custom_scan_tlist will make
+     * ExecInitCustomScan to initialize a scan slot with the type derived from
+     * this target list, as well as projection info and result slot correctly.
+     */
+    node->custom_scan_tlist = indextlist;
+    /* node->custom_relids is set by create_customscan_plan() */
+    node->methods = &aqp_swrindexonlyscan_methods;
+    
+    private->extnode.type = T_ExtensibleNode;
+    private->extnode.extnodename = AQPSWRIndexOnlyScanPrivateName;
+    private->indexid = indexid;
+    private->indexqual = NIL;
+    private->sample_size = sample_size;
+    private->repeatable_expr = repeatable_expr;
+    private->sample_size_expr = sample_size_expr;
+
+    return node;
+}
+
+static CustomScan*
+aqp_make_swrscan(List *qptlist,
+                 List *qpqual,
+                 Index scanrelid,
+                 Oid indexid,
+                 List *indexqual,
+                 List *indexqualorig,
+                 uint64 sample_size,
+                 Expr *repeatable_expr,
+                 Expr *sample_size_expr)
+{
+    CustomScan          *node = makeNode(CustomScan); 
+    Plan                *plan = &node->scan.plan;
+    AQPSWRScanPrivate   *private;
+
+    private = palloc(sizeof(AQPSWRScanPrivate));
+    
+    plan->targetlist = qptlist;
+    plan->qual = qpqual;
+    plan->lefttree = NULL;
+    plan->righttree = NULL;
+
+    /* 
+     * Providing scanrelid will make ExecInitCustomScan to open the relation
+     * for us before it calls BeginCustomScan.
+     */
+    node->scan.scanrelid = scanrelid;
+    node->custom_plans = NIL;
+    /* no backward scan or mark/restore support */
+    node->flags = 0;
+    /*
+     * Similar to aqp_make_swrindexonlyscan() but we can pass them as
+     * the regular custom_expres, so that nestloop var replacement happens
+     * in create_customscan_plan().
+     */
+    node->custom_exprs = list_make2(indexqual, indexqualorig);
+    node->custom_private = list_make1(private);
+    /*
+     * Must be NIL because we're returning heap tuples.
+     */
+    node->custom_scan_tlist = NIL;
+    /* node->custom_relids is set by create_customscan_plan() */
+    node->methods = &aqp_swrscan_methods;
+
+    private->extnode.type = T_ExtensibleNode;
+    private->extnode.extnodename = AQPSWRScanPrivateName;
+    private->indexid = indexid;
+    /* We still need fix_scan_list to fix the range table offsets. */
+    private->indexqual = NIL;
+    private->indexqualorig = NIL;
+    private->sample_size = sample_size;
+    private->repeatable_expr = repeatable_expr;
+    private->sample_size_expr = sample_size_expr;
+
+    return node;
+}
+
+/*
+ * aqp_pgport_fix_indexqual_references
+ *      Adjust indexqual clauses to the form the executor's indexqual
+ *      machinery needs.
+ *
+ * We have three tasks here:
+ *    * Select the actual qual clauses out of the input IndexClause list,
+ *      and remove RestrictInfo nodes from the qual clauses.
+ *    * Index keys must be represented by Var nodes with varattno set to the
+ *      index's attribute number, not the attribute number in the original rel.
+ *
+ * *stripped_indexquals_p receives a list of the actual qual clauses.
+ *
+ * *fixed_indexquals_p receives a list of the adjusted quals.  This is a copy
+ * that shares no substructure with the original; this is needed in case there
+ * are subplans in it (we need two separate copies of the subplan tree, or
+ * things will go awry).
+ */
+static void
+aqp_pgport_fix_indexqual_references(PlannerInfo *root,
+                                    IndexOptInfo *index,
+                                    List *indexclauses, 
+                                    List **stripped_indexquals_p,
+                                    List **fixed_indexquals_p)
+{
+    List       *stripped_indexquals;
+    List       *fixed_indexquals;
+    ListCell   *lc;
+
+    stripped_indexquals = fixed_indexquals = NIL;
+
+    foreach(lc, indexclauses)
+    {
+        IndexClause *iclause = lfirst_node(IndexClause, lc);
+        int            indexcol = iclause->indexcol;
+        ListCell   *lc2;
+
+        foreach(lc2, iclause->indexquals)
+        {
+            RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+            Node       *clause = (Node *) rinfo->clause;
+
+            stripped_indexquals = lappend(stripped_indexquals, clause);
+            clause = aqp_pgport_fix_indexqual_clause(root, index, indexcol,
+                                                     clause,
+                                                     iclause->indexcols);
+            fixed_indexquals = lappend(fixed_indexquals, clause);
+        }
+    }
+
+    *stripped_indexquals_p = stripped_indexquals;
+    *fixed_indexquals_p = fixed_indexquals;
+}
+
+/*
+ * aqp_pgport_fix_indexqual_clause
+ *      Convert a single indexqual clause to the form needed by the executor.
+ *
+ * We do not replace nestloop params now. We replace the index key
+ * variables or expressions by index Var nodes.
+ */
+static Node *
+aqp_pgport_fix_indexqual_clause(PlannerInfo *root, IndexOptInfo *index,
+                                int indexcol,
+                                Node *clause, List *indexcolnos)
+{
+    /*
+     * Replace any outer-relation variables with nestloop params.
+     *
+     * This also makes a copy of the clause, so it's safe to modify it
+     * in-place below.
+     */
+    /*clause = aqp_pgport_replace_nestloop_params(root, clause); */
+
+    clause = copyObject(clause);
+
+    if (IsA(clause, OpExpr))
+    {
+        OpExpr       *op = (OpExpr *) clause;
+
+        /* Replace the indexkey expression with an index Var. */
+        linitial(op->args) = aqp_pgport_fix_indexqual_operand(linitial(op->args),
+                                                              index,
+                                                              indexcol);
+    }
+    else if (IsA(clause, RowCompareExpr))
+    {
+        RowCompareExpr *rc = (RowCompareExpr *) clause;
+        ListCell   *lca,
+                   *lcai;
+
+        /* Replace the indexkey expressions with index Vars. */
+        Assert(list_length(rc->largs) == list_length(indexcolnos));
+        forboth(lca, rc->largs, lcai, indexcolnos)
+        {
+            lfirst(lca) = aqp_pgport_fix_indexqual_operand(lfirst(lca),
+                                                           index,
+                                                           lfirst_int(lcai));
+        }
+    }
+    else if (IsA(clause, ScalarArrayOpExpr))
+    {
+        ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+        /* Replace the indexkey expression with an index Var. */
+        linitial(saop->args) = aqp_pgport_fix_indexqual_operand(
+            linitial(saop->args), index, indexcol);
+    }
+    else if (IsA(clause, NullTest))
+    {
+        NullTest   *nt = (NullTest *) clause;
+
+        /* Replace the indexkey expression with an index Var. */
+        nt->arg = (Expr *) aqp_pgport_fix_indexqual_operand((Node *) nt->arg,
+                                                            index,
+                                                            indexcol);
+    }
+    else
+        elog(ERROR, "unsupported indexqual type: %d",
+             (int) nodeTag(clause));
+
+    return clause;
+}
+
+/*
+ * aqp_pgport_fix_indexqual_operand
+ *      Convert an indexqual expression to a Var referencing the index column.
+ *
+ * We represent index keys by Var nodes having varno == INDEX_VAR and varattno
+ * equal to the index's attribute number (index column position).
+ *
+ * Most of the code here is just for sanity cross-checking that the given
+ * expression actually matches the index column it's claimed to.
+ */
+static Node *
+aqp_pgport_fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
+{
+    Var           *result;
+    int            pos;
+    ListCell   *indexpr_item;
+
+    /*
+     * Remove any binary-compatible relabeling of the indexkey
+     */
+    if (IsA(node, RelabelType))
+        node = (Node *) ((RelabelType *) node)->arg;
+
+    Assert(indexcol >= 0 && indexcol < index->ncolumns);
+
+    if (index->indexkeys[indexcol] != 0)
+    {
+        /* It's a simple index column */
+        if (IsA(node, Var) &&
+            ((Var *) node)->varno == index->rel->relid &&
+            ((Var *) node)->varattno == index->indexkeys[indexcol])
+        {
+            result = (Var *) copyObject(node);
+            result->varno = INDEX_VAR;
+            result->varattno = indexcol + 1;
+            return (Node *) result;
+        }
+        else
+            elog(ERROR, "index key does not match expected index column");
+    }
+
+    /* It's an index expression, so find and cross-check the expression */
+    indexpr_item = list_head(index->indexprs);
+    for (pos = 0; pos < index->ncolumns; pos++)
+    {
+        if (index->indexkeys[pos] == 0)
+        {
+            if (indexpr_item == NULL)
+                elog(ERROR, "too few entries in indexprs list");
+            if (pos == indexcol)
+            {
+                Node       *indexkey;
+
+                indexkey = (Node *) lfirst(indexpr_item);
+                if (indexkey && IsA(indexkey, RelabelType))
+                    indexkey = (Node *) ((RelabelType *) indexkey)->arg;
+                if (equal(node, indexkey))
+                {
+                    result = makeVar(INDEX_VAR, indexcol + 1,
+                                     exprType(lfirst(indexpr_item)), -1,
+                                     exprCollation(lfirst(indexpr_item)),
+                                     0);
+                    return (Node *) result;
+                }
+                else
+                    elog(ERROR, "index key does not match expected index column");
+            }
+            indexpr_item = lnext(index->indexprs, indexpr_item);
+        }
+    }
+
+    /* Oops... */
+    elog(ERROR, "index key does not match expected index column");
+    return NULL;                /* keep compiler quiet */
+}
+
+/*
+ * aqp_pgport_order_qual_clauses
+ *        Given a list of qual clauses that will all be evaluated at the same
+ *        plan node, sort the list into the order we want to check the quals
+ *        in at runtime.
+ *
+ * When security barrier quals are used in the query, we may have quals with
+ * different security levels in the list.  Quals of lower security_level
+ * must go before quals of higher security_level, except that we can grant
+ * exceptions to move up quals that are leakproof.  When security level
+ * doesn't force the decision, we prefer to order clauses by estimated
+ * execution cost, cheapest first.
+ *
+ * Ideally the order should be driven by a combination of execution cost and
+ * selectivity, but it's not immediately clear how to account for both,
+ * and given the uncertainty of the estimates the reliability of the decisions
+ * would be doubtful anyway.  So we just order by security level then
+ * estimated per-tuple cost, being careful not to change the order when
+ * (as is often the case) the estimates are identical.
+ *
+ * Although this will work on either bare clauses or RestrictInfos, it's
+ * much faster to apply it to RestrictInfos, since it can re-use cost
+ * information that is cached in RestrictInfos.  XXX in the bare-clause
+ * case, we are also not able to apply security considerations.  That is
+ * all right for the moment, because the bare-clause case doesn't occur
+ * anywhere that barrier quals could be present, but it would be better to
+ * get rid of it.
+ *
+ * Note: some callers pass lists that contain entries that will later be
+ * removed; this is the easiest way to let this routine see RestrictInfos
+ * instead of bare clauses.  This is another reason why trying to consider
+ * selectivity in the ordering would likely do the wrong thing.
+ */
+static List *
+aqp_pgport_order_qual_clauses(PlannerInfo *root, List *clauses)
+{
+    typedef struct
+    {
+        Node       *clause;
+        Cost        cost;
+        Index        security_level;
+    } QualItem;
+    int            nitems = list_length(clauses);
+    QualItem   *items;
+    ListCell   *lc;
+    int            i;
+    List       *result;
+
+    /* No need to work hard for 0 or 1 clause */
+    if (nitems <= 1)
+        return clauses;
+
+    /*
+     * Collect the items and costs into an array.  This is to avoid repeated
+     * cost_qual_eval work if the inputs aren't RestrictInfos.
+     */
+    items = (QualItem *) palloc(nitems * sizeof(QualItem));
+    i = 0;
+    foreach(lc, clauses)
+    {
+        Node       *clause = (Node *) lfirst(lc);
+        QualCost    qcost;
+
+        cost_qual_eval_node(&qcost, clause, root);
+        items[i].clause = clause;
+        items[i].cost = qcost.per_tuple;
+        if (IsA(clause, RestrictInfo))
+        {
+            RestrictInfo *rinfo = (RestrictInfo *) clause;
+
+            /*
+             * If a clause is leakproof, it doesn't have to be constrained by
+             * its nominal security level.  If it's also reasonably cheap
+             * (here defined as 10X cpu_operator_cost), pretend it has
+             * security_level 0, which will allow it to go in front of
+             * more-expensive quals of lower security levels.  Of course, that
+             * will also force it to go in front of cheaper quals of its own
+             * security level, which is not so great, but we can alleviate
+             * that risk by applying the cost limit cutoff.
+             */
+            if (rinfo->leakproof && items[i].cost < 10 * cpu_operator_cost)
+                items[i].security_level = 0;
+            else
+                items[i].security_level = rinfo->security_level;
+        }
+        else
+            items[i].security_level = 0;
+        i++;
+    }
+
+    /*
+     * Sort.  We don't use qsort() because it's not guaranteed stable for
+     * equal keys.  The expected number of entries is small enough that a
+     * simple insertion sort should be good enough.
+     */
+    for (i = 1; i < nitems; i++)
+    {
+        QualItem    newitem = items[i];
+        int            j;
+
+        /* insert newitem into the already-sorted subarray */
+        for (j = i; j > 0; j--)
+        {
+            QualItem   *olditem = &items[j - 1];
+
+            if (newitem.security_level > olditem->security_level ||
+                (newitem.security_level == olditem->security_level &&
+                 newitem.cost >= olditem->cost))
+                break;
+            items[j] = *olditem;
+        }
+        items[j] = newitem;
+    }
+
+    /* Convert back to a list */
+    result = NIL;
+    for (i = 0; i < nitems; i++)
+        result = lappend(result, items[i].clause);
+
+    return result;
+}
+
+void
+aqp_fix_swrscan_exprs(Plan *plan)
+{
+    if (plan == NULL)
+        return;
+    
+    if (IsA(plan, CustomScan))
+    {
+        CustomScan *cscan = (CustomScan *) plan;
+        if (cscan->methods == &aqp_swrscan_methods)
+        {
+            AQPSWRScanPrivate *private =
+                (AQPSWRScanPrivate *) linitial(cscan->custom_private);
+            List *indexqual = (List *) linitial(cscan->custom_exprs);
+            List *indexqualorig = (List *) lsecond(cscan->custom_exprs);
+
+            /* fix the indexqual and custom_scan_tlist fields */ 
+            list_free(cscan->custom_exprs);
+            cscan->custom_exprs = NIL;
+            private->indexqual = indexqual;
+            private->indexqualorig = indexqualorig;
+        }
+        else if (cscan->methods == &aqp_swrindexonlyscan_methods)
+        {
+            AQPSWRIndexOnlyScanPrivate *private =
+                (AQPSWRIndexOnlyScanPrivate *) linitial(cscan->custom_private);
+
+            private->indexqual = cscan->custom_exprs;
+            cscan->custom_exprs = NULL;
+        }
+    }
+    else if (IsA(plan, SubqueryScan))
+    {
+        aqp_fix_swrscan_exprs(((SubqueryScan  *) plan)->subplan);
+    }
+
+    aqp_fix_swrscan_exprs(plan->lefttree);
+    aqp_fix_swrscan_exprs(plan->righttree);
+}
+
+List*
+aqp_reparameterize_custom_path_by_child(PlannerInfo *root,
+                                        List *custom_private,
+                                        RelOptInfo *child_rel)
+{
+    /* 
+     * TODO to implement this, we need to move the additional fields in
+     * AQPSWRPath into custom_private.
+     *
+     * NOTE(zy) we probably can't support partitioned nested loop right now
+     * anyway
+     */
+    Assert(custom_private == NIL);
+    return NIL;
+}
+
+
+
+void
+aqp_setup_path_hook(void)
+{
+    prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+    set_rel_pathlist_hook = aqp_set_rel_pathlist;
+}
+

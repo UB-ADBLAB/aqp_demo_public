@@ -1,0 +1,22 @@
+.nav-tabs {
+    font-family: Arial, sans-serif;
+  }
+
+.navbar-brand-title {
+    font-family: Arial, sans-serif;
+    font-size: 30px;
+  }
+
+  .th-txn-headers{
+    font-size: 20px;
+  }
+
+  .th-txn-name {
+    width: 20%;
+  }
+
+  .txn-range-input {
+    width: 100%;
+  }
+
+ 

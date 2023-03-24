@@ -1,0 +1,5 @@
+#!/bin/bash
+
+BASEDIR="$(cd "`dirname "$(realpath $0)"`"; pwd)"
+
+java -jar htapaqp.jar "$@"

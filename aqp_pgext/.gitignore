@@ -1,0 +1,4 @@
+*.o
+*.so
+.idea
+node_modules

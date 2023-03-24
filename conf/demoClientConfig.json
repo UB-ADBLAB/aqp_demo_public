@@ -1,0 +1,93 @@
+{
+  "queryPanelSelectionConfig": [
+    {
+      "displayText": "Q1: total revenue of sales up to a certain date",
+      "sqlStatements": [
+          "SELECT SUM(ol_amount) AS rev,\n            COUNT(*) AS lcnt\nFROM orderline\nWHERE ol_delivery_d <= '2023-02-28';",
+          "SELECT APPROX_SUM(ol_amount) AS rev,\n             APPROX_COUNT(*) AS lcnt,\n             COUNT(*) AS sample_size\nFROM orderline TABLESAMPLE SWR(4000)\nWHERE ol_delivery_d <= '2023-02-28';",
+          "SELECT APPROX_SUM(ol_amount) AS rev,\n             APPROX_COUNT(*) AS lcnt,\n             COUNT(*) AS sample_size\nFROM orderline TABLESAMPLE BERNOULLI(0.0045)\nWHERE ol_delivery_d <= '2023-02-28';"
+      ]
+    },
+    {
+      "displayText": "Q1 with CI for SWR",
+      "sqlStatements": [
+        "SELECT SUM(ol_amount) AS rev,\n            COUNT(*) AS lcnt\nFROM orderline\nWHERE ol_delivery_d < '2023-03-10';",
+		"SELECT rev, rev_e / rev AS rev_rel_ci,\n             lcnt, lcnt_e / lcnt AS lcnt_rel_ci\nFROM (SELECT APPROX_SUM(ol_amount) AS rev,\n                         APPROX_SUM_HALF_CI(ol_amount, 0.95) AS rev_e,\n                         APPROX_COUNT(*) AS lcnt,\n                         APPROX_COUNT_STAR_HALF_CI(0.95) AS lcnt_e\n             FROM orderline TABLESAMPLE SWR(1000)\n             WHERE ol_delivery_d < '2023-03-10') T;",
+        "SELECT APPROX_SUM(ol_amount) AS rev,\n             APPROX_COUNT(*) AS lcnt\nFROM orderline TABLESAMPLE BERNOULLI(0.2)\nWHERE ol_delivery_d < '2023-03-10';"
+      ]
+    },
+    {
+      "displayText": "Q2: fetching 10 orderline with amount higher than 1.5 times of average",
+      "sqlStatements": [
+        "SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT\nFROM orderline\nWHERE ol_amount > 1.5 * (\n                SELECT AVG(ol_amount)\n                FROM orderline)\nLIMIT 10;",
+        "SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT\nFROM orderline\nWHERE ol_amount > 1.5 * (\n                SELECT AVG(ol_amount)\n                FROM orderline TABLESAMPLE SWR(1000))\nLIMIT 10;",
+        "SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT\nFROM orderline\nWHERE ol_amount > 1.5 * (\n                SELECT AVG(ol_amount)\n                FROM orderline TABLESAMPLE BERNOULLI(0.5))\nLIMIT 10;"
+      ]
+    },
+    {
+      "displayText": "Q2-rand: fetching 10 random orderline with amount higher than 1.5 times of average",
+      "sqlStatements": [
+        "SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT\nFROM (SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT, RANDOM() as rnd\n            FROM orderline\n            WHERE ol_amount > 1.5 * (\n                              SELECT AVG(ol_amount)\n                              FROM orderline)\n            ORDER BY RND\n            LIMIT 10) T;",
+        "SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT\nFROM orderline TABLESAMPLE SWR(10)\nWHERE ol_amount > 1.5 * (\n                SELECT AVG(ol_amount)\n                FROM orderline TABLESAMPLE SWR(1000));",
+        "SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT\nFROM (SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT, RANDOM() as rnd\n            FROM orderline\n            WHERE ol_amount > 1.5 * (\n                              SELECT AVG(ol_amount)\n                              FROM orderline TABLESAMPLE BERNOULLI(0.5))\n            ORDER BY RND\n            LIMIT 10) T;"
+      ]
+    },
+    {
+        "displayText": "Q3: total revenue of sales for customers grouped by credit rating",
+        "sqlStatements": [
+            "SELECT c_credit AS credit, SUM(ol_amount) as rev, COUNT(*) AS lcnt\nFROM orderline,\n           orders, customer\nWHERE c_id =  o_c_id AND c_w_id  = o_w_id AND c_d_id = o_d_id\n     AND ol_o_id =  o_id AND ol_w_id = o_w_id AND ol_d_id = o_d_id\nGROUP BY credit\nORDER BY credit;",
+            "SELECT c_credit AS credit, APPROX_SUM(ol_amount) as rev, APPROX_COUNT(*) AS lcnt\nFROM orderline TABLESAMPLE SWR(4000),\n           orders, customer\nWHERE c_id =  o_c_id AND c_w_id  = o_w_id AND c_d_id = o_d_id\n     AND ol_o_id =  o_id AND ol_w_id = o_w_id AND ol_d_id = o_d_id\nGROUP BY credit\nORDER BY credit;",
+            "SELECT c_credit AS credit, APPROX_SUM(ol_amount) as rev, APPROX_COUNT(*) AS lcnt\nFROM orderline TABLESAMPLE BERNOULLI(0.004),\n           orders, customer\nWHERE c_id =  o_c_id AND c_w_id  = o_w_id AND c_d_id = o_d_id\n     AND ol_o_id =  o_id AND ol_w_id = o_w_id AND ol_d_id = o_d_id\nGROUP BY credit\nORDER BY credit;"
+        ]
+    },
+    {
+        "displayText": "Q3 with CI for SWR",
+        "sqlStatements": [
+            "SELECT c_credit AS credit, SUM(ol_amount) as rev, COUNT(*) AS lcnt\nFROM orderline,\n           orders, customer\nWHERE c_id =  o_c_id AND c_w_id  = o_w_id AND c_d_id = o_d_id\n     AND ol_o_id =  o_id AND ol_w_id = o_w_id AND ol_d_id = o_d_id\nGROUP BY credit\nORDER BY credit;",
+            "SELECT credit, rev, lcnt, rev_e / rev AS rev_rel_ci, lcnt_e / lcnt AS lcnt_rel_ci\nFROM (SELECT c_credit AS credit,\n                         APPROX_SUM(ol_amount) as rev, APPROX_SUM_HALF_CI(ol_amount, 0.95) AS rev_e,\n                         APPROX_COUNT(*) AS lcnt, APPROX_COUNT_STAR_HALF_CI(0.95) AS lcnt_e\n            FROM orderline TABLESAMPLE SWR(4000),\n                       orders, customer\n            WHERE c_id =  o_c_id AND c_w_id  = o_w_id AND c_d_id = o_d_id\n                 AND ol_o_id =  o_id AND ol_w_id = o_w_id AND ol_d_id = o_d_id\n            GROUP BY credit\n            ORDER BY credit) T;",
+            "SELECT c_credit AS credit, APPROX_SUM(ol_amount) as rev, APPROX_COUNT(*) AS lcnt\nFROM orderline TABLESAMPLE BERNOULLI(0.004),\n           orders, customer\nWHERE c_id =  o_c_id AND c_w_id  = o_w_id AND c_d_id = o_d_id\n     AND ol_o_id =  o_id AND ol_w_id = o_w_id AND ol_d_id = o_d_id\nGROUP BY credit\nORDER BY credit;"
+        ]
+    }
+  ],
+  "txnPanelSelectionConfig": [
+    {
+      "displayText": "TPC-C Heavy Insertion + Ad-hoc Approx. Queries",
+      "txnConfig": [
+        {"TxnName": "NewOrder", "Probability": 50},
+        {"TxnName": "Payment", "Probability": 30},
+        {"TxnName": "OrderStatus", "Probability": 0},
+        {"TxnName": "Delivery", "Probability": 20},
+        {"TxnName": "StockLevel", "Probability": 0}
+      ],
+      "nThreads": 10,
+      "nSamplingThreads": 10,
+      "sampleSize": 10000
+    },
+    {
+      "displayText": "Ad-hoc Approx. Queries",
+      "txnConfig": [
+        {"TxnName": "NewOrder", "Probability": 50},
+        {"TxnName": "Payment", "Probability": 30},
+        {"TxnName": "OrderStatus", "Probability": 0},
+        {"TxnName": "Delivery", "Probability": 20},
+        {"TxnName": "StockLevel", "Probability": 0}
+      ],
+      "nThreads": 0,
+      "nSamplingThreads": 20,
+      "sampleSize": 10000
+    },
+    {
+      "displayText": "TPC-C Heavy Insertion",
+      "txnConfig": [
+        {"TxnName": "NewOrder", "Probability": 50},
+        {"TxnName": "Payment", "Probability": 30},
+        {"TxnName": "OrderStatus", "Probability": 0},
+        {"TxnName": "Delivery", "Probability": 20},
+        {"TxnName": "StockLevel", "Probability": 0}
+      ],
+      "nThreads": 20,
+      "nSamplingThreads": 0,
+      "sampleSize": 10000
+    }
+  ]
+}

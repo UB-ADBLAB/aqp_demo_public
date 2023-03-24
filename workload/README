@@ -1,0 +1,15 @@
+./makeJar.sh: make a jar containing the driver code and the pg jdbc dep
+
+If you just made a copy of a fresh database without the stored proc, run
+./setup.sh once.
+
+to run a workload: ./runbgtxn.sh <nTPCCThreads> <nSamplingThreads>
+to STOP it, type STOP and hit enter
+
+Scenario 1: no runbgtxn.sh running. Get the timing data for all queries.
+Scenario 2: ./runbgtxn.sh 20 0. Get timing data for all queries: active
+updates, no concurrent analytical jobs
+Scenario 3: ./runbgtxn.sh 0 10. Get timing data of all queries: no updates,
+active concurrent analytical jobs
+Scenario 4: ./runbgtxn.sh 20 10. Get timing data of all: both active updates
+and analytical jobs

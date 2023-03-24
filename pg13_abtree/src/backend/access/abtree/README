@@ -1,0 +1,10 @@
+Aggregate b-tree implementation based on Postgres btree (access/nbtree).
+
+Any file src/backend/access/abtree/abtxxx.c is copied and adapted from
+src/backend/access/nbtree/nbtxxx.c, where nbtxxx.c is an existing source file.
+
+Exceptions:
+	nbtcompare.c	--	Not duplicated.
+	
+
+

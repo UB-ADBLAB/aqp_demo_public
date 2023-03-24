@@ -1,0 +1,10 @@
+/node_modules
+.idea
+/.vscode
+/package-lock.json
+/public/bundle.js
+/public/bundle.js.LICENSE.txt
+/public/bundle.js.map
+/src/common/aqpConfig.json
+/src/common/aqpQueryAndTxnState.json
+/src/common/clientConfig.json

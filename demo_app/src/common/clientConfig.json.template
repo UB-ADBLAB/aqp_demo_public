@@ -1,0 +1,48 @@
+{
+  "queryPanelSelectionConfig": [
+    {
+      "displayText": "history, districts and customers",
+      "sqlStatements": [
+        "select count(*) from history;",
+        "select count(*) from district;",
+        "select count(*) from customer;"
+      ]
+    },
+    {
+      "displayText": "get number of districts, warehouses and customers",
+      "sqlStatements": [
+        "select count(*) from district;",
+        "select count(*) from warehouse;",
+        "select count(*) from customer;"
+      ]
+    }
+  ],
+  "txnPanelSelectionConfig": [
+    {
+      "displayText": "TPCC workload 1",
+      "txnConfig": [
+        {"TxnName": "NewOrder", "Probability": 50},
+        {"TxnName": "Payment", "Probability": 40},
+        {"TxnName": "OrderStatus", "Probability": 0},
+        {"TxnName": "Delivery", "Probability": 10},
+        {"TxnName": "StockLevel", "Probability": 0}
+      ],
+      "nThreads": 10,
+      "nSamplingThreads": 10,
+      "sampleSize": 10000
+    },
+    {
+      "displayText": "TPCC workload 2",
+      "txnConfig": [
+        {"TxnName": "NewOrder", "Probability": 50},
+        {"TxnName": "Payment", "Probability": 40},
+        {"TxnName": "OrderStatus", "Probability": 0},
+        {"TxnName": "Delivery", "Probability": 10},
+        {"TxnName": "StockLevel", "Probability": 0}
+      ],
+      "nThreads": 10,
+      "nSamplingThreads": 0,
+      "sampleSize": 5000
+    }
+  ]
+}
